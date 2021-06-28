@@ -1,4 +1,6 @@
 import re
+import pysftp
+import os
 
 
 class Observer:
@@ -20,13 +22,15 @@ class Observer:
             match = reg.match(self.config.get('connect'))
             assert match, 'incorrect connection data'
             self._config.update(match.groupdict())
-        assert not ({'host', 'port', 'user'} - self.config.keys()), \
+        assert not ({'host', 'user'} - self.config.keys()), \
             'incorrect connection data, you must specify host port and user'
         try:
-            self._config['port'] = int(self._config['port'])
+            if self.config.get('port'):
+                self._config['port'] = int(self._config['port'])
         except ValueError:
             assert 0, 'incorrect port passed'
         assert 'password' in self.config, 'password or ssh keys must be specified'
+        assert 'deployPath' in self.config, 'deploy path is not specified'
         password_in_source = re.match(r'source\s+(?P<filename>\S+)', self.config['password'])
         if password_in_source:
             try:
@@ -41,6 +45,11 @@ class Observer:
                 self.parse_config(config)
         except FileNotFoundError:
             raise FileNotFoundError('deploy.config file is missng in current directory')
+        try:
+            self.validate_config()
+        except AssertionError as e:
+            self.error(str(e))
+            raise RuntimeError('config file validation failed')
 
     def parse_config(self, file):
         base_expr = re.compile(r'''^
@@ -100,12 +109,39 @@ class Observer:
     def error(message):
         print(f'ERROR: {message}')
 
+    @staticmethod
+    def log(message):
+        print(f'{message}')
+
+    def iter_file(self):
+        yield '.', 'run.py'  # todo
+        return
+        for root, directories, files in os.walk('.', topdown=True):
+            pass  # todo
+
+    def upload(self):
+        cnopts = pysftp.CnOpts()
+        cnopts.hostkeys = None
+        sftp = pysftp.Connection(
+            host=self.config['host'], port=self.config.get('port', 22), username=self.config['user'],
+            password=self.config['password'], cnopts=cnopts
+        )
+        tree_cache = []
+
+        def make_path(path):
+            if path in tree_cache:
+                return
+
+        for relative_local_path, filename in self.iter_file():
+            make_path(relative_local_path)
+            lp = os.path.join(relative_local_path, filename).replace('\\', '/')
+            rp = os.path.normpath(
+                os.path.join(self.config['deployPath'], relative_local_path, filename)).replace('\\', '/')
+            sftp.put(lp, rp, callback=lambda: self.log(f'TRANSFER {self.config["host"]}: {lp} -> {rp}'))
+        sftp.close()
+
 
 if __name__ == '__main__':
     observer = Observer()
-    try:
-        observer.validate_config()
-    except AssertionError as e:
-        observer.error(str(e))
-        assert 0
+    observer.upload()
     pass
