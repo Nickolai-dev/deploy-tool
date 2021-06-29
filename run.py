@@ -2,10 +2,20 @@ import re
 import pysftp
 import os
 
+TESTING_OFFLINE = True
+
+
+# class OfflineTesting:
+#     def __init__(self) -> None:
+#         pass
+
+#     def put(self, local_path, remote_path):
+#         os.path.
+
 
 class Observer:
     _config = {
-        'ignore': []
+        'ignore': ['.deploycache']
     }
 
     @property
@@ -114,34 +124,58 @@ class Observer:
         print(f'{message}')
 
     def iter_file(self):
-        yield '.', 'run.py'  # todo
-        return
+        # yield '.', 'run.py'  # todo
+        # return
         for root, directories, files in os.walk('.', topdown=True):
-            pass  # todo
-
-    def upload(self):
+            for directory in directories.copy():
+                dirpath = os.path.join(root, directory)
+                if any(map(lambda ignored: os.path.exists(ignored) and os.path.samefile(ignored, dirpath), self.config['ignore'])):
+                    directories.remove(directory)  # excluding directories on the fly possible when topdown=True
+            for file in files:
+                normpath = os.path.normpath(os.path.join(root, file)).replace('\\', '/')
+                if not any(map(lambda ignored: os.path.exists(ignored) and os.path.samefile(ignored, normpath), self.config['ignore'])):
+                    yield root, normpath
+    
+    def _setup_connection(self):
         cnopts = pysftp.CnOpts()
         cnopts.hostkeys = None
-        sftp = pysftp.Connection(
+        # if not TESTING_OFFLINE:
+        self.conn = pysftp.Connection(
             host=self.config['host'], port=self.config.get('port', 22), username=self.config['user'],
             password=self.config['password'], cnopts=cnopts
         )
+        # else:
+        #     self.conn = os.path
+    
+    def _put_one_file(self, local_path, remote_path):
+        self.conn.put(local_path, remote_path, callback=lambda: self.log(f'TRANSFER {self.config["host"]}: {local_path} -> {remote_path}'))
+
+    def upload(self):
         tree_cache = []
 
-        def make_path(path):
-            if path in tree_cache:
+        def make_path(dirpath):
+            dirpath = os.normpath(dirpath).replace('\\', '/')
+            if dirpath in tree_cache:
                 return
-
+            tree_cache.append(dirpath)
+            if self.conn.isdir(dirpath):
+                return
+            top = '/'.join(dirpath.split('/')[:-1])
+            if top not in ['', '.']:
+                make_path(top)
+            self.conn.mkdir(dirpath)
         for relative_local_path, filename in self.iter_file():
-            make_path(relative_local_path)
+            make_path(os.path.normpath(os.path.join(self.config['deployPath'], relative_local_path)).replace('\\', '/'))
             lp = os.path.join(relative_local_path, filename).replace('\\', '/')
             rp = os.path.normpath(
                 os.path.join(self.config['deployPath'], relative_local_path, filename)).replace('\\', '/')
-            sftp.put(lp, rp, callback=lambda: self.log(f'TRANSFER {self.config["host"]}: {lp} -> {rp}'))
-        sftp.close()
+            self._put_one_file(lp, rp)
+        self.conn.close()
 
 
 if __name__ == '__main__':
     observer = Observer()
-    observer.upload()
+    # observer.upload()
+    for item in observer.iter_file():
+        print(item)
     pass
