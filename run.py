@@ -1,22 +1,18 @@
 import re
 import pysftp
 import os
-
-TESTING_OFFLINE = True
-
-
-# class OfflineTesting:
-#     def __init__(self) -> None:
-#         pass
-
-#     def put(self, local_path, remote_path):
-#         os.path.
+import sys
+from beaker.cache import CacheManager
+import beaker.util
+import hashlib
+import argparse
 
 
 class Observer:
     _config = {
         'ignore': ['.deploycache']
     }
+    _cache = None
 
     @property
     def config(self):
@@ -28,7 +24,7 @@ class Observer:
 
     def validate_config(self):
         if 'connect' in self.config:
-            reg = re.compile(r'(?P<user>[^\@:\s\\]+)\@(?P<host>[^\@:\s\\]+):(?P<port>\d+)')
+            reg = re.compile(r'(?P<user>[^@:\s\\]+)@(?P<host>[^@:\s\\]+):(?P<port>\d+)')
             match = reg.match(self.config.get('connect'))
             assert match, 'incorrect connection data'
             self._config.update(match.groupdict())
@@ -49,7 +45,8 @@ class Observer:
             except FileNotFoundError:
                 raise AssertionError('password source file is missing')
 
-    def __init__(self):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
         try:
             with open('./deploy.config') as config:
                 self.parse_config(config)
@@ -69,7 +66,7 @@ class Observer:
             (?:(?P<commentline>\#[^\n]+)) |  # full comment line
             (?:(?P<key>[\d\w]+)\s+(?P<value>[^\n]+))  # base
         \s*$''', re.VERBOSE)
-        path_expr = re.compile('''^
+        path_expr = re.compile(r'''^
             (?:\s+) |  # empty line
             (?P<ignore>:ignore) |  # ignore files open tag
             (?P<endignore>:endignore) |  # ignore files close tag
@@ -108,7 +105,7 @@ class Observer:
                         with open(match.groupdict()['pathsource']) as pathsource:
                             lines = pathsource.readlines()
                         lines = list(map(lambda n: n[:-1] if n[-1] == '\n' else n, filter(
-                            lambda l: re.match(r'^[^\#\s]+$', l), lines)))
+                            lambda l: re.match(r'^[^#\s]+$', l), lines)))
                         self._config['ignore'].extend(lines)
 
     @staticmethod
@@ -121,49 +118,57 @@ class Observer:
 
     @staticmethod
     def log(message):
-        print(f'{message}')
+        print(message)
 
     def iter_file(self):
-        # yield '.', 'run.py'  # todo
-        # return
         for root, directories, files in os.walk('.', topdown=True):
             for directory in directories.copy():
                 dirpath = os.path.join(root, directory)
-                if any(map(lambda ignored: os.path.exists(ignored) and os.path.samefile(ignored, dirpath), self.config['ignore'])):
+                if any(map(lambda ignored: os.path.exists(ignored) and os.path.samefile(ignored, dirpath),
+                           self.config['ignore'])):
                     directories.remove(directory)  # excluding directories on the fly possible when topdown=True
             for file in files:
                 normpath = os.path.normpath(os.path.join(root, file)).replace('\\', '/')
-                if not any(map(lambda ignored: os.path.exists(ignored) and os.path.samefile(ignored, normpath), self.config['ignore'])):
-                    yield root, normpath
-    
+                if not any(map(lambda ignored: os.path.exists(ignored) and os.path.samefile(ignored, normpath),
+                               self.config['ignore'])):
+                    if self._file_hash_is_old(normpath):
+                        continue
+                    yield root, file
+
     def _setup_connection(self):
         cnopts = pysftp.CnOpts()
         cnopts.hostkeys = None
-        # if not TESTING_OFFLINE:
         self.conn = pysftp.Connection(
             host=self.config['host'], port=self.config.get('port', 22), username=self.config['user'],
             password=self.config['password'], cnopts=cnopts
         )
-        # else:
-        #     self.conn = os.path
-    
+
     def _put_one_file(self, local_path, remote_path):
-        self.conn.put(local_path, remote_path, callback=lambda: self.log(f'TRANSFER {self.config["host"]}: {local_path} -> {remote_path}'))
+        self.conn.put(local_path, remote_path, callback=lambda sz, fsz: self.log(
+            f'TRANSFER {self.config["host"]}: {local_path} {fsz} -> {remote_path} {sz}'))
 
     def upload(self):
-        tree_cache = []
+        self._setup_connection()
+        tree_cache = set()
 
         def make_path(dirpath):
-            dirpath = os.normpath(dirpath).replace('\\', '/')
+            dirpath = os.path.normpath(dirpath).replace('\\', '/')
             if dirpath in tree_cache:
                 return
-            tree_cache.append(dirpath)
+            tree_cache.add(dirpath)
             if self.conn.isdir(dirpath):
+                s = ''
+                for i in dirpath.split('/'):
+                    if not i:
+                        continue
+                    s += '/' + i
+                    tree_cache.add(s)
                 return
             top = '/'.join(dirpath.split('/')[:-1])
             if top not in ['', '.']:
                 make_path(top)
             self.conn.mkdir(dirpath)
+
         for relative_local_path, filename in self.iter_file():
             make_path(os.path.normpath(os.path.join(self.config['deployPath'], relative_local_path)).replace('\\', '/'))
             lp = os.path.join(relative_local_path, filename).replace('\\', '/')
@@ -172,10 +177,38 @@ class Observer:
             self._put_one_file(lp, rp)
         self.conn.close()
 
+    def _file_hash_is_old(self, normpath):
+        cache_dir = os.path.join(os.environ['HOMEPATH'], '.deploy-cache') if sys.platform.find(
+            'win') > -1 else '/tmp/.deploy-cache'
+        cache_lock_dir = os.path.join(os.environ['HOMEPATH'], '.deploy-cache-lock') if sys.platform.find(
+            'win') > -1 else '/tmp/.deploy-cache-lock'
+        if not os.path.isdir(cache_dir):
+            os.mkdir(cache_dir)
+        if not self._cache:
+            self._cache = CacheManager(**beaker.util.parse_cache_config_options({
+                'cache.type': 'file',
+                'cache.data_dir': cache_dir,
+                'cache.lock_dir': cache_lock_dir
+            }))
+        cache = self._cache.get_cache('cache', expire=8 * 3600)
+        md5_obj = hashlib.md5()
+        with open(normpath, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b''):
+                md5_obj.update(chunk)
+        cur_hash = md5_obj.hexdigest()
+        if normpath not in cache:
+            is_the_same = False
+        else:
+            old_hash = cache.get(normpath)
+            is_the_same = old_hash == cur_hash
+        cache.put(normpath, cur_hash)
+        return is_the_same
+
 
 if __name__ == '__main__':
-    observer = Observer()
+    parser = argparse.ArgumentParser(
+        description='''Deploy files by sftp in live mode using keyboard shortcuts''')
+    parser.add_argument()
+    # observer = Observer()
     # observer.upload()
-    for item in observer.iter_file():
-        print(item)
     pass
