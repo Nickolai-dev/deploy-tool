@@ -6,11 +6,17 @@ from beaker.cache import CacheManager
 import beaker.util
 import hashlib
 import argparse
+import keyboard
+import signal
+import asyncio
+import time
 
 
 class Observer:
     _config = {
-        'ignore': ['.deploycache']
+        'ignore': ['.deploycache'],
+        'shortcut-upload': 'ctrl+alt+shift+x',
+        'shortcut-cache-clear': 'ctrl+alt+shift+z'
     }
     _cache = None
 
@@ -204,11 +210,52 @@ class Observer:
         cache.put(normpath, cur_hash)
         return is_the_same
 
+    def clear_cache(self):
+        if self._cache:
+            cache = self._cache.get_cache('cache', expire=8 * 3600)
+            cache.clear()
+            self.log('cache cleaned')
+
+
+class Loop:
+    _graceful_exit = False
+
+    def __init__(self):
+        exiter = lambda: 0
+        for signame in ['SIGINT', 'SIGTERM', 'SIGKILL']:
+            signum = getattr(signal, signame, None)
+            if signum is None:
+                continue
+            old_handler = signal.getsignal(signum)
+            if not callable(old_handler):
+                continue
+            exiter = self._graceful_exit_deco(old_handler)
+            signal.signal(signum, lambda: None)  # fixme: doesnt catch, dont know why
+        keyboard.add_hotkey('ctrl+c', exiter)
+        self.observer = Observer()
+        keyboard.add_hotkey(self.observer.config['shortcut-upload'], self.proc_for_upload)
+        keyboard.add_hotkey(self.observer.config['shortcut-cache-clear'], lambda: self.observer.clear_cache())
+
+        def loop():
+            while not self._graceful_exit:
+                yield time.sleep(10)  # acceptable
+        asyncio.get_event_loop().run_until_complete(loop())
+
+    def _graceful_exit_deco(self, old_handler):
+        def new_handler():
+            if not self._graceful_exit:
+                self.observer.log('Interrupted; wait for clean shutdown; press Ctrl+C again to submit unclean shutdown')
+                self._graceful_exit = True
+            else:
+                return old_handler()
+        return new_handler
+
+    def proc_for_upload(self):
+        self.observer.upload()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='''Deploy files by sftp in live mode using keyboard shortcuts''')
-    parser.add_argument()
-    # observer = Observer()
-    # observer.upload()
-    pass
+    # parser.add_argument()
+    Loop()
